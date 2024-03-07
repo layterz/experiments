@@ -56,34 +56,71 @@ def get_device():
     return device
 
 def run_prompts(model, *prompts):
-    print(f'Running prompt: {prompts}')
     device = get_device()
     _, cache = model.run_with_cache(list(prompts))
     cache.prompts = list(prompts)
     cache.device = device
     return cache
 
-def calculate_attns(cache, l, h, **kwargs):
+def hadamard_product_upto_position(q, k):
+    # Get the number of elements in the final dimension
+    final_dim = q.size(-1)
+    
+    # Create a mask to select elements up to and including the position
+    mask = torch.tril(torch.ones(final_dim, final_dim)).to(q.device).unsqueeze(0).unsqueeze(0)
+    
+    # Expand q and k to match the shape of the mask
+    q_expanded = q.unsqueeze(2).expand(-1, -1, final_dim, -1)
+    k_expanded = k.unsqueeze(1).expand(-1, final_dim, -1, -1)
+    
+    # Apply the mask to q_expanded and k_expanded
+    q_masked = q_expanded * mask
+    k_masked = k_expanded * mask
+    
+    # Take the Hadamard product of q_masked and k_masked along the last dimension
+    result = q_masked * k_masked
+    
+    return result
+
+def hadamard_product_upto_position(q, k):
+    # Create a mask to select elements up to and including the position
+    mask = torch.tril(torch.ones(q.size(1), k.size(1))).to(q.device).unsqueeze(-1).unsqueeze(0)
+    
+    # Expand q and k to match the shape of the mask
+    q_expanded = q.unsqueeze(2)
+    k_expanded = k.unsqueeze(1)
+    
+    # Apply the mask to q_expanded and k_expanded
+    q_masked = q_expanded * mask
+    k_masked = k_expanded * mask
+    
+    # Take the Hadamard product of q_masked and k_masked along the last dimension
+    result = q_masked * k_masked
+    
+    return result
+
+def calculate_attns(cache, l, h):
     prompts = cache.prompts
     model = cache.model
-    input_tokens = model.to_tokens(prompts)
-    batch, seq_len = len(prompts), len(input_tokens[0])
+    selected = random.randint(0, len(prompts) - 1)
+    input_tokens = model.to_tokens(prompts[selected])
+    seq_len = len(input_tokens[0])
     
     q, k, v = decompose_head(cache, l, h, pos=(0, seq_len))
-    attn = cache['attn', l][:, h]
-    qs = unembed_resid(cache, l, h, q.expand(batch, seq_len, seq_len, -1))
-    ks = unembed_resid(cache, l, h, k.expand(batch, seq_len, seq_len, -1))
-    vs = unembed_resid(cache, l, h, v.expand(batch, seq_len, seq_len, -1))
-    hp = q.unsqueeze(2) * k.unsqueeze(1)
+    attn = cache['attn', l][selected, h]
+    qs = unembed_resid(cache, l, h, q.unsqueeze(2).expand(-1, -1, seq_len, -1))
+    ks = unembed_resid(cache, l, h, k.unsqueeze(2).expand(-1, -1, seq_len, -1))
+    vs = unembed_resid(cache, l, h, v.unsqueeze(2).expand(-1, -1, seq_len, -1))
+    hp = hadamard_product_upto_position(q, k)
     hp = unembed_resid(cache, l, h, hp)
 
     data = torch.stack([
-        input_tokens.expand(batch, seq_len, seq_len),
+        input_tokens.expand(seq_len, seq_len),
         attn,
-        hp.unsqueeze(0),
-        qs.unsqueeze(0),
-        ks.unsqueeze(0),
-        vs.unsqueeze(0),
+        hp,
+        qs,
+        ks,
+        vs,
     ], dim=-1)
 
     mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(cache.device)
@@ -91,6 +128,9 @@ def calculate_attns(cache, l, h, **kwargs):
     data = data.masked_fill(mask, -1)
 
     return data
+
+def outer_product(x, y):
+    return q.unsqueeze(2) * k.unsqueeze(1)
 
 def add_attn_overlay(cache, fig, data, min_attn=0.3):
     seq_len = data.shape[1]
@@ -118,17 +158,17 @@ def add_axis_labels(cache, fig, data, fontsize=12, padding=20):
     input_str_tokens = parse_tokens(input_str_tokens)
 
     q_str_tokens = [
-        cache.model.to_single_str_token(t) for t in data[0, -1, :, 3].int().tolist()
+        cache.model.to_single_str_token(t) for t in torch.diag(data[0, :, :, 3]).int().tolist()
     ]
     q_str_tokens = parse_tokens(q_str_tokens)
 
     k_str_tokens = [
-        cache.model.to_single_str_token(t) for t in data[0, -1, :, 4].int().tolist()
+        cache.model.to_single_str_token(t) for t in torch.diag(data[0, :, :, 4]).int().tolist()
     ]
     k_str_tokens = parse_tokens(k_str_tokens)
 
     v_str_tokens = [
-        cache.model.to_single_str_token(t) for t in data[0, -1, :, 5].int().tolist()
+        cache.model.to_single_str_token(t) for t in torch.diag(data[0, :, :, 5]).int().tolist()
     ]
     v_str_tokens = parse_tokens(v_str_tokens)
 
@@ -166,6 +206,8 @@ def unique_index_pattern(feature):
     for x in feature:
         for y in x:
             value = y.int().item()
+            if value == -1:
+                unique_tokens[-1] = -len(unique_tokens)
             if value not in unique_tokens:
                 unique_tokens[value] = len(unique_tokens)
 
@@ -173,7 +215,7 @@ def unique_index_pattern(feature):
         [unique_tokens[y.int().item()] for y in x] for x in feature
     ]
 
-def plot_attns(pattern, title=None, cmap='viridis'):
+def attn_grid(pattern, title=None, cmap='viridis'):
     fig = px.imshow(
         pattern,
         color_continuous_scale=cmap,
@@ -191,14 +233,46 @@ def plot_attns(pattern, title=None, cmap='viridis'):
     fig.update_coloraxes(showscale=False)
     return fig
 
-def compare_plots(a, b, title=None, description=None, figure_layout={'width': 600, 'height': 400}):
+def plot_attn(cache, l, h, feature=2, show_attn_overlay=True, show_axis=True, show_grid_labels=True):
+    data = calculate_attns(cache, l, h)
+    feature = data[:, :, :, feature]
+    unique_token_pattern = unique_index_pattern(feature[0])
+    plot = attn_grid(unique_token_pattern)
+    if show_attn_overlay:
+        plot = add_attn_overlay(cache, plot, data)
+    if show_axis:
+        plot = add_axis_labels(cache, plot, data)
+    if show_grid_labels:
+        plot = add_token_labels(cache, plot, data, 2)
+    return plot
+
+def head_index(i):
+    return (i // 12, i % 12)
+
+def plot_attns(cache, heads, **kwargs):
+    plots = [plot_attn(cache, *head_index(h), **kwargs) for h in heads]
+    return plots
+
+def plot_layout(n):
+    if n == 1:
+        return {'width': 1000, 'height': 1000}
+    if n == 2:
+        return {'width': 600, 'height': 600}
+    if n == 3:
+        return {'width': 400, 'height': 400}
+    if n == 4:
+        return {'width': 350, 'height': 350}
+    if n == 5:
+        return {'width': 300, 'height': 300}
+    
+    raise Exception(f"Invalid grid shape: {n} plots.")
+
+def plot_grid(*plots, title=None, description=None, rowsize=4):
+    figure_layout = plot_layout(min(len(plots), rowsize))
     plot_widgets = [
         go.FigureWidget(
-            p.update_layout(
-                width=figure_layout['width'],
-                height=figure_layout['height'],
-            )
-        ) for p in (a, b)
+            p.update_layout(**figure_layout)
+        ) for p in plots
     ]
 
     content = []
@@ -206,9 +280,10 @@ def compare_plots(a, b, title=None, description=None, figure_layout={'width': 60
         title_widget = HTML(f"<h2 style='font-size: {14}; text-align: center;'>{title}</h2>")
         content.append(title_widget)
     
-    content.append(HBox(plot_widgets))
+    for i in range(0, len(plot_widgets), rowsize):
+        content.append(HBox(plot_widgets[i:i+rowsize]))
     
     if description is not None:
-        description_widget = HTML(f"<p style='font-size: {12}; text-align: center;'>{description}</p>")
+        description_widget = HTML(f"<p style='font-size: {14}; text-align: center;'>{description}</p>")
         content.append(description_widget)
     display(VBox(content))
