@@ -233,16 +233,16 @@ def attn_grid(pattern, title=None, cmap='viridis'):
     fig.update_coloraxes(showscale=False)
     return fig
 
-def plot_attn(cache, l, h, feature=2, show_attn_overlay=True, show_axis=True, show_grid_labels=True):
+def plot_attn(cache, l, h, feature=2, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True):
     data = calculate_attns(cache, l, h)
     feature = data[:, :, :, feature]
     unique_token_pattern = unique_index_pattern(feature[0])
     plot = attn_grid(unique_token_pattern)
-    if show_attn_overlay:
+    if not hide_labels and show_attn_overlay:
         plot = add_attn_overlay(cache, plot, data)
-    if show_axis:
+    if not hide_labels and show_axis:
         plot = add_axis_labels(cache, plot, data)
-    if show_grid_labels:
+    if not hide_labels and show_grid_labels:
         plot = add_token_labels(cache, plot, data, 2)
     return plot
 
@@ -267,7 +267,7 @@ def plot_layout(n):
     
     raise Exception(f"Invalid grid shape: {n} plots.")
 
-def plot_grid(*plots, title=None, description=None, rowsize=4):
+def plot_grid(*plots, title=None, description=None, footer=None, rowsize=4):
     figure_layout = plot_layout(min(len(plots), rowsize))
     plot_widgets = [
         go.FigureWidget(
@@ -280,10 +280,14 @@ def plot_grid(*plots, title=None, description=None, rowsize=4):
         title_widget = HTML(f"<h2 style='font-size: {14}; text-align: center;'>{title}</h2>")
         content.append(title_widget)
     
-    for i in range(0, len(plot_widgets), rowsize):
-        content.append(HBox(plot_widgets[i:i+rowsize]))
-    
     if description is not None:
         description_widget = HTML(f"<p style='font-size: {14}; text-align: center;'>{description}</p>")
         content.append(description_widget)
+    
+    for i in range(0, len(plot_widgets), rowsize):
+        content.append(HBox(plot_widgets[i:i+rowsize]))
+    
+    if footer is not None:
+        footer_widget = HTML(f"<p style='font-size: {14}; text-align: center;'>{footer}</p>")
+        content.append(footer_widget)
     display(VBox(content))
