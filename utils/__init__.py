@@ -6,12 +6,14 @@ import einops
 from fancy_einsum import einsum
 from rich import print
 from transformer_lens.utils import Slice
+from transformer_lens import HookedTransformer
 from plotly import express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
 from ipywidgets import Dropdown, Output, VBox, HBox, Layout, Label, HTML
-from IPython.display import display
+from IPython.display import display, clear_output
+pio.renderers.default = "png"
 
 
 def parse_tokens(tokens):
@@ -42,11 +44,6 @@ def project_attn(cache, l, h, c):
     proj_B = torch.einsum('b n m d, h d -> b n m d', proj_A, OV.B)
     return proj_B
 
-def unembed_resid(cache, l, h, c):
-    rs = project_attn(cache, l, h, c)
-    logits = cache.model.unembed(rs[0])
-    return torch.argmax(logits, dim=-1)
-
 def get_device():
     device = torch.device("cpu")
     if torch.cuda.is_available():
@@ -55,32 +52,12 @@ def get_device():
         device = torch.device("mps")
     return device
 
-def run_prompts(model, *prompts):
+def run_prompts(model: HookedTransformer, *prompts, **kwargs):
     device = get_device()
-    _, cache = model.run_with_cache(list(prompts))
+    _, cache = model.run_with_cache(list(prompts), **kwargs)
     cache.prompts = list(prompts)
     cache.device = device
     return cache
-
-def hadamard_product_upto_position(q, k):
-    # Get the number of elements in the final dimension
-    final_dim = q.size(-1)
-    
-    # Create a mask to select elements up to and including the position
-    mask = torch.tril(torch.ones(final_dim, final_dim)).to(q.device).unsqueeze(0).unsqueeze(0)
-    
-    # Expand q and k to match the shape of the mask
-    q_expanded = q.unsqueeze(2).expand(-1, -1, final_dim, -1)
-    k_expanded = k.unsqueeze(1).expand(-1, final_dim, -1, -1)
-    
-    # Apply the mask to q_expanded and k_expanded
-    q_masked = q_expanded * mask
-    k_masked = k_expanded * mask
-    
-    # Take the Hadamard product of q_masked and k_masked along the last dimension
-    result = q_masked * k_masked
-    
-    return result
 
 def hadamard_product_upto_position(q, k):
     # Create a mask to select elements up to and including the position
@@ -99,28 +76,33 @@ def hadamard_product_upto_position(q, k):
     
     return result
 
+def hadamard_product(x, y):
+    return x.unsqueeze(2) * y.unsqueeze(1)
+
+def unembed_resid(cache, l, h, c):
+    rs = project_attn(cache, l, h, c)
+    logits = torch.stack([cache.model.unembed(r) for r in rs])
+    return torch.argmax(logits, dim=-1)
+
 def calculate_attns(cache, l, h):
     prompts = cache.prompts
     model = cache.model
-    selected = random.randint(0, len(prompts) - 1)
-    input_tokens = model.to_tokens(prompts[selected])
-    seq_len = len(input_tokens[0])
+    input_tokens = model.to_tokens(prompts)
+    seq_len = input_tokens.shape[1]
     
-    q, k, v = decompose_head(cache, l, h, pos=(0, seq_len))
-    attn = cache['attn', l][selected, h]
+    q, k, v = decompose_head(cache, l, h)
+    attn = cache['attn', l][:, h]
     qs = unembed_resid(cache, l, h, q.unsqueeze(2).expand(-1, -1, seq_len, -1))
     ks = unembed_resid(cache, l, h, k.unsqueeze(2).expand(-1, -1, seq_len, -1))
     vs = unembed_resid(cache, l, h, v.unsqueeze(2).expand(-1, -1, seq_len, -1))
-    hp = hadamard_product_upto_position(q, k)
+    hp = hadamard_product(q, k)
     hp = unembed_resid(cache, l, h, hp)
 
     data = torch.stack([
-        input_tokens.expand(seq_len, seq_len),
+        input_tokens.unsqueeze(2).expand(-1, seq_len, seq_len),
         attn,
         hp,
-        qs,
-        ks,
-        vs,
+        qs, ks, vs,
     ], dim=-1)
 
     mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(cache.device)
@@ -129,23 +111,20 @@ def calculate_attns(cache, l, h):
 
     return data
 
-def outer_product(x, y):
-    return q.unsqueeze(2) * k.unsqueeze(1)
-
-def add_attn_overlay(cache, fig, data, min_attn=0.3):
-    seq_len = data.shape[1]
-    pattern = data[0, :, :, 1]
+def add_attn_overlay(fig, pattern, threshold=0.3):
+    seq_len = pattern.shape[1]
     for i in range(seq_len):
         for j in range(i + 1):
-            if pattern[i, j] > min_attn:
+            if pattern[i, j] > threshold:
                 fig.add_shape(
                     type="rect",
                     x0=j-0.5,
                     y0=i-0.5,
                     x1=j+0.5,
                     y1=i+0.5,
-                    line=dict(color="white", width=2),
+                    line=dict(color="white", width=min(3, 2 + 5 * pattern[i, j].item())),
                     fillcolor="rgba(0, 0, 0, 0)",
+                    opacity=min(1, pattern[i, j].item()),
                 )
     return fig
 
@@ -233,17 +212,20 @@ def attn_grid(pattern, title=None, cmap='viridis'):
     fig.update_coloraxes(showscale=False)
     return fig
 
-def plot_attn(cache, l, h, feature=2, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True):
-    data = calculate_attns(cache, l, h)
+def plot_attn(cache, l, h, feature=2, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, **kwargs):
+    data = calculate_attns(cache, l, h, **kwargs)
     feature = data[:, :, :, feature]
+    attention = data[:, :, :, 1]
     unique_token_pattern = unique_index_pattern(feature[0])
     plot = attn_grid(unique_token_pattern)
     if not hide_labels and show_attn_overlay:
-        plot = add_attn_overlay(cache, plot, data)
+        plot = add_attn_overlay(plot, attention[0], threshold=0)
     if not hide_labels and show_axis:
         plot = add_axis_labels(cache, plot, data)
     if not hide_labels and show_grid_labels:
         plot = add_token_labels(cache, plot, data, 2)
+    if title is not None:
+        plot.update_layout(title=title)
     return plot
 
 def head_index(i):
@@ -268,10 +250,12 @@ def plot_layout(n):
     raise Exception(f"Invalid grid shape: {n} plots.")
 
 def plot_grid(*plots, title=None, description=None, footer=None, rowsize=4):
+    default_renderer = pio.renderers.default
+    pio.renderers.default = "png"
     figure_layout = plot_layout(min(len(plots), rowsize))
     plot_widgets = [
         go.FigureWidget(
-            p.update_layout(**figure_layout)
+            p.update_layout(**figure_layout),
         ) for p in plots
     ]
 
@@ -281,13 +265,41 @@ def plot_grid(*plots, title=None, description=None, footer=None, rowsize=4):
         content.append(title_widget)
     
     if description is not None:
-        description_widget = HTML(f"<p style='font-size: {14}; text-align: center;'>{description}</p>")
+        description_widget = HTML(f"<p style='font-size: {14}; text-align: center; width: 60%; margin: 0 auto;'>{description}</p>")
         content.append(description_widget)
     
     for i in range(0, len(plot_widgets), rowsize):
-        content.append(HBox(plot_widgets[i:i+rowsize]))
+        row_plots = plot_widgets[i:i+rowsize]
+        content.append(HBox(row_plots))
     
     if footer is not None:
         footer_widget = HTML(f"<p style='font-size: {14}; text-align: center;'>{footer}</p>")
         content.append(footer_widget)
+    
     display(VBox(content))
+    pio.renderers.default = default_renderer
+
+def plot_heads(cache, heads, **kwargs):
+    plots = plot_attns(cache, heads, **kwargs)
+    dropdown = Dropdown(
+        options=[('Head {0}.{1}'.format(*head_index(i)), i) for i in range(len(plots))],
+        value=0,
+        description='Select Plot:',
+    )
+    output = Output()
+
+    def update_plot(change):
+        with output:
+            clear_output(wait=True)  # Clear the previous plot
+            # Directly display the selected plot
+            plots[change['new']].show('png')
+
+    dropdown.observe(update_plot, names='value')
+
+    # Initialize with the first plot
+    update_plot({'new': 0})
+
+    return VBox([dropdown, output])
+
+def compare_plots(a, b):
+    return HBox([a, b])
