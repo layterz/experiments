@@ -187,7 +187,7 @@ def to_df(data):
 
 def load(filepath):
     df = pd.read_csv(filepath)
-    df.columns = ['Input token', 'attn', 'hp', 'q', 'k', 'v']
+    df.columns = ['layer', 'head', 'Input token', 'attn', 'hp', 'q', 'k', 'v']
     return df
 
 def token_freq_data(model, df, feature, shape):
@@ -329,17 +329,17 @@ def add_axis_labels(cache, ax, data, fontsize=12, feature_index=0):
     input_str_tokens = parse_tokens(input_str_tokens)
 
     q_str_tokens = [
-        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 3]).int().tolist()
+        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 5]).int().tolist()
     ]
     q_str_tokens = parse_tokens(q_str_tokens)
 
     k_str_tokens = [
-        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 4]).int().tolist()
+        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 6]).int().tolist()
     ]
     k_str_tokens = parse_tokens(k_str_tokens)
 
     v_str_tokens = [
-        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 5]).int().tolist()
+        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 7]).int().tolist()
     ]
     v_str_tokens = parse_tokens(v_str_tokens)
 
@@ -361,7 +361,7 @@ def add_axis_labels(cache, ax, data, fontsize=12, feature_index=0):
 
     return ax
 
-def add_token_labels(cache, ax, data, feature=2, feature_index=0, fontsize=10):
+def add_token_labels(cache, ax, data, feature=4, feature_index=0, fontsize=10):
     seq_len = data.shape[1]
     tokens = data[feature_index, :, :, feature].int().tolist()
     str_tokens = [
@@ -370,11 +370,11 @@ def add_token_labels(cache, ax, data, feature=2, feature_index=0, fontsize=10):
     for i in range(seq_len):
         for j in range(i + 1):
             text = str_tokens[i][j]
-            ax.text(j, i, text, ha='center', va='center', fontsize=fontsize, color='white')
+            ax.text(j, i, text, ha='center', va='center', fontsize=fontsize, color='white', rotation=45)
     return ax
 
-def plot_attn(cache, attn_data, feature=2, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None, **kwargs):
-    attention = attn_data[:, :, :, 1]
+def plot_attn(cache, attn_data, feature=4, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None, **kwargs):
+    attention = attn_data[:, :, :, 3]
     feature_data = attn_data[:, :, :, feature]
     if feature_index is None:
         feature_index = random.randint(0, len(feature_data) - 1)
