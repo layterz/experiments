@@ -17,11 +17,15 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.patches as patches
 import matplotlib.colors as mcolors
+from mpl_toolkits.mplot3d import Axes3D
+import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import umap
 from IPython.display import display, clear_output
+
 pio.renderers.default = "png"
+plt.ioff()
 
 
 def parse_tokens(tokens):
@@ -78,15 +82,15 @@ def decompose_head(cache, l, h, pos=None):
     v = cache['v', l][:, start:end, h, :]
     return torch.stack([q, k, v])
 
-def project_attn(cache, l, h, c):
-    OV = cache.model.OV[l, h]
+def project_attn(model, l, h, c):
+    OV = model.OV[l, h]
     proj_A = torch.einsum('b n m h, d h -> b n m d', c, OV.A)
     proj_B = torch.einsum('b n m d, h d -> b n m d', proj_A, OV.B)
     return proj_B
 
-def unembed_resid(cache, l, h, c):
-    rs = project_attn(cache, l, h, c)
-    logits = torch.stack([cache.model.unembed(r) for r in rs])
+def unembed_resid(model, l, h, c):
+    rs = project_attn(model, l, h, c)
+    logits = torch.stack([model.unembed(r) for r in rs])
     return torch.argmax(logits, dim=-1)
 
 def calculate_attns(cache, l, h):
@@ -97,15 +101,15 @@ def calculate_attns(cache, l, h):
     
     q, k, v = decompose_head(cache, l, h)
     attn = cache['attn', l][:, h]
-    qs = unembed_resid(cache, l, h, q.unsqueeze(2).expand(-1, -1, seq_len, -1))
-    ks = unembed_resid(cache, l, h, k.unsqueeze(2).expand(-1, -1, seq_len, -1))
-    vs = unembed_resid(cache, l, h, v.unsqueeze(2).expand(-1, -1, seq_len, -1))
-    qk = unembed_resid(cache, l, h, q.unsqueeze(2) * k.unsqueeze(1))
+    qs = unembed_resid(cache.model, l, h, q.unsqueeze(2).expand(-1, -1, seq_len, -1))
+    ks = unembed_resid(cache.model, l, h, k.unsqueeze(2).expand(-1, -1, seq_len, -1))
+    vs = unembed_resid(cache.model, l, h, v.unsqueeze(2).expand(-1, -1, seq_len, -1))
+    qk = unembed_resid(cache.model, l, h, q.unsqueeze(2) * k.unsqueeze(1))
     q_reshaped = q.unsqueeze(2).transpose(1, 2)
     k_reshaped = k.unsqueeze(1).transpose(1, 2)
     qk = torch.einsum('bhse,bhte->bhst', q_reshaped, k_reshaped)
     qk = qk.transpose(1, 2).contiguous()
-    qk = unembed_resid(cache, l, h, qk)
+    qk = unembed_resid(cache.model, l, h, qk)
     layers = torch.full((batch, seq_len, seq_len), l).to(cache.device)
     heads = torch.full((batch, seq_len, seq_len), h).to(cache.device)
 
@@ -153,8 +157,8 @@ def plot_layout(n):
     
     raise Exception(f"Invalid grid shape: {n} plots.")
 
-def plot_heads(cache, heads, **kwargs):
-    plots = plot_attns(cache, heads, **kwargs)
+def plot_heads(model, heads, **kwargs):
+    plots = plot_attns(model, heads, **kwargs)
     dropdown = Dropdown(
         options=[('Head {0}.{1}'.format(*head_index(i)), i) for i in range(len(plots))],
         value=0,
@@ -199,10 +203,10 @@ def token_freq_data(model, df, feature, shape):
     tf['Token'] = tf['Token'].astype(int)
     tf = tf.groupby(['Head', 'Token']).size().reset_index(name='Frequency')
     tf['Token str'] = tf['Token'].apply(model.to_single_str_token)
-    tf['SortedIndex'] = tf.groupby('Head')['Frequency'].rank(method='dense', ascending=False)
+    tf['Rank'] = tf.groupby('Head')['Frequency'].rank(method='dense', ascending=False)
     return tf
 
-def plot_scatter(x, y, c, xlabel, ylabel, title=None, ax=None, cmap=cm.viridis, colorbar_label=None, jitter_scale=0, s=5, alpha=0.7):
+def plot_scatter(x, y, c, ax=None, cmap=cm.viridis, jitter_scale=0, s=5, alpha=0.7, third_dim=None):
     show_fig = False
     if ax is None:
         show_fig = True
@@ -214,34 +218,33 @@ def plot_scatter(x, y, c, xlabel, ylabel, title=None, ax=None, cmap=cm.viridis, 
         x += jitter[:, 0]
         y += jitter[:, 1]
     
-    ax.scatter(x, y, c=c, cmap=cmap, s=s, alpha=alpha)
+    if third_dim is not None:
+        ax.scatter(x, y, third_dim, c=c, cmap=cmap, s=3, alpha=alpha)
+    else:
+        ax.scatter(x, y, c=c, cmap=cmap, s=s, alpha=alpha)
+
     if show_fig:
         ax.tight_layout()
         ax.show()
     return ax
 
-def plot_token_frequencies(model, token_counts, **kwargs):
-    plot_scatter(token_counts['SortedIndex'], token_counts['Frequency'], token_counts['Head'],
-                 'Sorted Index', 'Frequency', 'Token Frequencies Grouped by Heads', **kwargs)
+def plot_token_frequencies(model, token_counts, ax=None):
+    plot_scatter(token_counts['Rank'], token_counts['Frequency'], token_counts['Head'], ax=ax)
 
-def plot_unique_tokens_by_head(model, token_counts, **kwargs):
+def plot_unique_tokens_by_head(model, token_counts, ax=None):
     unique_token_counts = token_counts.groupby('Head')['Token'].nunique().reset_index(name='Unique Tokens')
     num_heads_per_layer = model.cfg.n_heads
     unique_token_counts['Layer'] = unique_token_counts['Head'] // num_heads_per_layer
-    
-    plot_scatter(unique_token_counts['Head'], unique_token_counts['Unique Tokens'], unique_token_counts['Layer'],
-                 'Head Index', 'Count of Unique Tokens', 'Unique Token Counts by Head', **kwargs)
+    plot_scatter(unique_token_counts['Head'], unique_token_counts['Unique Tokens'], unique_token_counts['Layer'], ax=ax)
 
-def plot_unique_tokens_by_layer_head(model, token_counts, **kwargs):
+def plot_unique_tokens_by_layer_head(model, token_counts, ax=None):
     unique_token_counts = token_counts.groupby('Head')['Token'].nunique().reset_index(name='Unique Tokens')
     num_heads_per_layer = model.cfg.n_heads
     unique_token_counts['Layer'] = unique_token_counts['Head'] // num_heads_per_layer
     unique_token_counts['Head Index within Layer'] = unique_token_counts['Head'] % num_heads_per_layer
-    
-    plot_scatter(unique_token_counts['Head Index within Layer'], unique_token_counts['Unique Tokens'], unique_token_counts['Layer'],
-                 'Head Index within Layer', 'Count of Unique Tokens', 'Unique Token Counts by Layer and Head', **kwargs)
+    plot_scatter(unique_token_counts['Head Index within Layer'], unique_token_counts['Unique Tokens'], unique_token_counts['Layer'], ax=ax)
 
-def plot_token_embeddings(model, token_counts, embedding_method, colorbar_label='Head', **kwargs):
+def plot_token_embeddings(model, token_counts, embedding_method, colorbar_label='Head', projection=2, ax=None, **kwargs):
     token_heads = token_counts[['Token', colorbar_label]].drop_duplicates()
     
     token_embeddings = []
@@ -250,24 +253,23 @@ def plot_token_embeddings(model, token_counts, embedding_method, colorbar_label=
         token_embeddings.append(embedding)
     
     if embedding_method == 'PCA':
-        embedding_model = PCA(n_components=kwargs.get('num_components', 2))
+        embedding_model = PCA(n_components=projection)
     elif embedding_method == 'TSNE':
-        embedding_model = TSNE(n_components=2, perplexity=kwargs.get('perplexity', 30),
+        embedding_model = TSNE(n_components=projection, perplexity=kwargs.get('perplexity', 30),
                                learning_rate=kwargs.get('learning_rate', 200), random_state=42)
     elif embedding_method == 'UMAP':
         embedding_model = umap.UMAP(n_neighbors=kwargs.get('n_neighbors', 15), min_dist=kwargs.get('min_dist', 0.1),
-                                    n_components=2, random_state=42)
+                                    n_components=projection, random_state=42)
     else:
         raise ValueError(f"Unsupported embedding method: {embedding_method}")
     
     token_embeddings_transformed = embedding_model.fit_transform(np.stack(token_embeddings))
-    
-    df_embeddings = pd.DataFrame(token_embeddings_transformed, columns=[f'{embedding_method}{i+1}' for i in range(2)])
+    df_embeddings = pd.DataFrame(token_embeddings_transformed, columns=[f'{embedding_method}{i+1}' for i in range(projection)])
     df_embeddings['Token'] = token_heads['Token']
     df_embeddings[colorbar_label] = token_heads[colorbar_label]
     
-    plot_scatter(df_embeddings[f'{embedding_method}1'], df_embeddings[f'{embedding_method}2'], df_embeddings[colorbar_label],
-                 f'{embedding_method}1', f'{embedding_method}2', f'Token Embeddings {embedding_method}', **kwargs)
+    third_dim = None if projection == 2 else df_embeddings[f'{embedding_method}3']
+    plot_scatter(df_embeddings[f'{embedding_method}1'], df_embeddings[f'{embedding_method}2'], df_embeddings[colorbar_label], third_dim=third_dim, ax=ax)
 
 def add_max_labels(df, group_col, value_col, label_col, label_func):
     max_values = df.groupby(group_col)[value_col].max()
@@ -285,7 +287,7 @@ def figure(body, title=None, description=None, footer=None):
         content.append(title_widget)
     
     if description is not None:
-        description_widget = HTML(f"<p style='font-size: {14}; text-align: center; width: 60%; margin: 0 auto;'>{description}</p>")
+        description_widget = HTML(f"<p style='font-size: {14}; text-align: center; width: 80%; margin: 0 auto 40px auto;'>{description}</p>")
         content.append(description_widget)
         
     # Create an Output widget to capture the figure
@@ -298,10 +300,10 @@ def figure(body, title=None, description=None, footer=None):
     content.append(output)
     
     if footer is not None:
-        footer_widget = HTML(f"<p style='font-size: {14}; text-align: center;'>{footer}</p>")
+        footer_widget = HTML(f"<p style='font-size: {14}; text-align: center; margin-bottom: 40px;'>{footer}</p>")
         content.append(footer_widget)
     
-    return VBox(content)
+    return VBox(content, layout=Layout(align_items='center'))
 
 def add_attn_overlay(ax, pattern, threshold=0.3):
     seq_len = pattern.shape[1]
@@ -320,26 +322,26 @@ def add_attn_overlay(ax, pattern, threshold=0.3):
                 ax.add_patch(rect)
     return ax
 
-def add_axis_labels(cache, ax, data, fontsize=12, feature_index=0):
+def add_axis_labels(model, ax, data, fontsize=12, feature_index=0):
     seq_len = data.shape[1]
     input_tokens = data[feature_index, -1, :, 0].int().tolist()
     input_str_tokens = [
-        cache.model.to_single_str_token(t) for t in input_tokens
+        model.to_single_str_token(t) for t in input_tokens
     ]
     input_str_tokens = parse_tokens(input_str_tokens)
 
     q_str_tokens = [
-        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 5]).int().tolist()
+        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 5]).int().tolist()
     ]
     q_str_tokens = parse_tokens(q_str_tokens)
 
     k_str_tokens = [
-        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 6]).int().tolist()
+        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 6]).int().tolist()
     ]
     k_str_tokens = parse_tokens(k_str_tokens)
 
     v_str_tokens = [
-        cache.model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 7]).int().tolist()
+        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 7]).int().tolist()
     ]
     v_str_tokens = parse_tokens(v_str_tokens)
 
@@ -361,11 +363,11 @@ def add_axis_labels(cache, ax, data, fontsize=12, feature_index=0):
 
     return ax
 
-def add_token_labels(cache, ax, data, feature=4, feature_index=0, fontsize=10):
+def add_token_labels(model, ax, data, feature=4, feature_index=0, fontsize=10):
     seq_len = data.shape[1]
     tokens = data[feature_index, :, :, feature].int().tolist()
     str_tokens = [
-        [cache.model.to_single_str_token(t) for t in row if t > -1] for row in tokens
+        [model.to_single_str_token(t) for t in row if t > -1] for row in tokens
     ]
     for i in range(seq_len):
         for j in range(i + 1):
@@ -373,7 +375,7 @@ def add_token_labels(cache, ax, data, feature=4, feature_index=0, fontsize=10):
             ax.text(j, i, text, ha='center', va='center', fontsize=fontsize, color='white', rotation=45)
     return ax
 
-def plot_attn(cache, attn_data, feature=4, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None, **kwargs):
+def plot_attn(model, attn_data, feature=4, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None, **kwargs):
     attention = attn_data[:, :, :, 3]
     feature_data = attn_data[:, :, :, feature]
     if feature_index is None:
@@ -382,15 +384,15 @@ def plot_attn(cache, attn_data, feature=4, feature_index=None, title=None, hide_
 
     fig = None
     if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 10))
+        fig, ax = plt.subplots(figsize=(12, 8))
     
     ax.imshow(pattern)
     if not hide_labels and show_attn_overlay:
         ax = add_attn_overlay(ax, attention[feature_index], threshold=0)
     if not hide_labels and show_axis:
-        ax = add_axis_labels(cache, ax, attn_data, feature_index=feature_index)
+        ax = add_axis_labels(model, ax, attn_data, feature_index=feature_index)
     if not hide_labels and show_grid_labels:
-        ax = add_token_labels(cache, ax, attn_data, feature=feature, feature_index=feature_index)
+        ax = add_token_labels(model, ax, attn_data, feature=feature, feature_index=feature_index)
     if title:
         ax.set_title(title)
     if hide_labels:
@@ -398,6 +400,112 @@ def plot_attn(cache, attn_data, feature=4, feature_index=None, title=None, hide_
     
     return fig
 
-def plot_attns(cache, heads, **kwargs):
-    plots = [plot_attn(cache, *head_index(h), **kwargs) for h in heads]
+def plot_attns(model, heads, **kwargs):
+    plots = [plot_attn(model, *head_index(h), **kwargs) for h in heads]
     return plots
+
+def gallery(figs):
+    def on_dropdown_change(change):
+        layer, head = change['new'].split(',')
+        layer = int(layer)
+        head = int(head)
+        fig = plot_attn(layer, head)
+        output.clear_output(wait=True)
+        with output:
+            display(fig)
+
+    # Create a dropdown widget
+    options = [(f"Layer {layer}, Head {head}", f"{layer},{head}") for layer in range(12) for head in range(12)]
+    dropdown = Dropdown(options=options, description="Select Layer and Head:")
+
+    # Create an output widget to display the plot
+    output = Output()
+
+    # Observe changes in the dropdown value
+    dropdown.observe(on_dropdown_change, names='value')
+
+    # Display the dropdown and output widgets
+    display(dropdown)
+    display(output)
+
+def shared_tokens(df, component='hp'):
+    at = df[['layer', 'head', 'Input token', component, 'attn']]
+    at.columns = ['layer', 'head', 'input_token', 'attention_token', 'attention_score']
+
+    # Analyze subgroups for each attention head
+    subgroup_data = []
+    for layer, head in at[['layer', 'head']].drop_duplicates().itertuples(index=False):
+        subgroup_mask = (at['layer'] == layer) & (at['head'] == head)
+        unique_tokens = at.loc[subgroup_mask, 'attention_token'].unique()
+        subgroup_data.append({
+            'Layer': layer,
+            'Head': head,
+            'Unique Tokens': len(unique_tokens),
+            'Tokens': ','.join(map(str, unique_tokens))
+        })
+
+    subgroups_df = pd.DataFrame(subgroup_data)
+
+    # Analyze shared tokens between subgroups
+    shared_token_data = []
+    for i, (layer1, head1) in enumerate(subgroups_df[['Layer', 'Head']].itertuples(index=False)):
+        for layer2, head2 in subgroups_df[['Layer', 'Head']].iloc[i+1:].itertuples(index=False):
+            tokens1 = set(map(float, subgroups_df[(subgroups_df['Layer'] == layer1) & (subgroups_df['Head'] == head1)]['Tokens'].iloc[0].split(',')))
+            tokens2 = set(map(float, subgroups_df[(subgroups_df['Layer'] == layer2) & (subgroups_df['Head'] == head2)]['Tokens'].iloc[0].split(',')))
+            shared_tokens = tokens1.intersection(tokens2)
+            if len(shared_tokens) > 0:
+                shared_token_data.append({
+                    'Subgroup 1': chr((int(layer1) * 12) + int(head1) + 65),
+                    'Subgroup 2': chr((int(layer2) * 12) + int(head2) + 65),
+                    'Shared Tokens': len(shared_tokens),
+                    'Tokens': ','.join(map(str, shared_tokens))
+                })
+
+    return pd.DataFrame(shared_token_data)
+
+def get_subgroup_label(layer_index, head_index):
+    single_value = (layer_index * 12) + head_index
+    return chr(single_value + ord('A'))
+
+def visualize_shared_tokens(df, ax=None):
+    # Assuming your data is stored in a DataFrame called 'df'
+    # Extract the subgroup information and shared token counts from the DataFrame
+    subgroup1 = df['Subgroup 1'].astype(str)
+    subgroup2 = df['Subgroup 2'].astype(str)
+    shared_tokens = df['Shared Tokens'].astype(int)
+
+    # Create a new DataFrame with subgroups as columns and shared token counts
+    heatmap_data = pd.DataFrame({'Subgroup 1': subgroup1, 'Subgroup 2': subgroup2, 'Shared Tokens': shared_tokens})
+
+    # Pivot the data to create a matrix
+    shared_matrix = heatmap_data.pivot_table(index='Subgroup 2', columns='Subgroup 1', values='Shared Tokens', fill_value=0)
+
+    # Create a figure and axes
+    fig = None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Create the heatmap using Seaborn
+    sns.heatmap(shared_matrix, annot=False, cmap='viridis', cbar_kws={'label': 'Shared Tokens'}, ax=ax)
+
+    # Set the plot title and labels
+    ax.set_title('Heatmap of Shared Tokens between Subgroups')
+    ax.set_xlabel('Subgroup')
+    ax.set_ylabel('Subgroup')
+
+    num_ticks = 12  # Number of ticks to display
+    step = len(shared_matrix) // num_ticks
+    xtick_labels = [(i // 12, i % 12) for i in range(0, len(shared_matrix.columns), step)]
+    ytick_labels = [(i // 12, i % 12) for i in range(0, len(shared_matrix.index), step)]
+
+    ax.set_xticks(range(0, len(shared_matrix.columns), step))
+    ax.set_xticklabels(xtick_labels)
+    ax.set_yticks(range(0, len(shared_matrix.index), step))
+    ax.set_yticklabels(ytick_labels)
+
+    plt.xticks(rotation=-45, ha='left')
+    plt.yticks(rotation=45, ha='right')
+
+    # Display the plot
+    plt.tight_layout()
+    return fig
