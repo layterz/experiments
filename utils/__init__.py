@@ -509,3 +509,71 @@ def visualize_shared_tokens(df, ax=None):
     # Display the plot
     plt.tight_layout()
     return fig
+
+def print_max_logits(cache, component='resid_post', layer=-1, k=5):
+    resid_stream = cache[component, layer]
+    resid_stream = cache.apply_ln_to_stack(resid_stream, layer)
+
+    logits = cache.model.unembed(resid_stream)
+    logits = cache.apply_ln_to_stack(logits, layer)
+
+    top_pred_tokens = torch.topk(logits, k=k, dim=-1).indices.permute(2, 0, 1)
+    tokens = cache.model.to_tokens(cache.prompts)
+    pred_resid_directions = cache.model.tokens_to_residual_directions(top_pred_tokens[:, :, :-1])
+    token_resid_directions = cache.model.tokens_to_residual_directions(tokens[:, 1:])
+    data = torch.stack([
+        (token_resid_directions - token_resid_directions).abs().mean((0, -1)),
+        *(pred_resid_directions - token_resid_directions).abs().mean((1, -1)),
+    ])
+    fig = px.imshow(
+        data.cpu(),
+        color_continuous_midpoint=-0.5,
+        color_continuous_scale="rdbu",
+    )
+
+    example_prompt = cache.model.to_str_tokens(cache.prompts[0])[1:] + ["..."]
+    for x in range(len(example_prompt)):
+        fig.add_annotation(x=x, y=0, text=example_prompt[x], showarrow=False, xshift=0, yshift=0, font=dict(size=16, color='white'))
+        # use white if current cell is dark, black otherwise
+        for i in range(k):
+            color = 'black' if x == len(example_prompt) - 1 else 'white'
+            fig.add_annotation(
+                x=x, y=i + 1, 
+                text=cache.model.tokenizer.decode(top_pred_tokens[i, 0, x]), 
+                showarrow=False, xshift=0, yshift=0, font=dict(size=16, color=color),
+            )
+
+    fig.update_layout(
+        width=1200, height=800,
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False)
+    )
+
+    fig.update_coloraxes(showscale=False)
+    return fig
+
+def calculate_logit_diff(cache, completions):
+    pred_tokens = torch.tensor([
+        [cache.model.to_single_token(c) for c in completions] 
+        for completions in completions 
+    ]).to(cache.device)
+
+    resid_directions = cache.model.tokens_to_residual_directions(pred_tokens)
+    return resid_directions[:, 0] - resid_directions[:, 1]
+
+def calculate_head_contribution(cache, towards, layer=-1, pos_slice=-1):
+    per_head_residual = cache.stack_head_results(
+        layer=layer, pos_slice=pos_slice,
+    )
+
+    per_head_logit_diffs = einsum(
+        "... batch d_model, batch d_model -> ...",
+        per_head_residual, towards,
+    )
+
+    return einops.rearrange(
+        per_head_logit_diffs,
+        "(layer head_index) -> layer head_index",
+        layer=cache.model.cfg.n_layers,
+        head_index=cache.model.cfg.n_heads,
+    )
