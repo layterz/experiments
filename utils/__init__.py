@@ -140,7 +140,7 @@ def unique_index_pattern(feature):
         [unique_tokens[y.int().item()] for y in x] for x in feature
     ]
     
-def head_index(i):
+def get_head_index(i):
     return (i // 12, i % 12)
 
 def plot_layout(n):
@@ -160,7 +160,7 @@ def plot_layout(n):
 def plot_heads(model, heads, **kwargs):
     plots = plot_attns(model, heads, **kwargs)
     dropdown = Dropdown(
-        options=[('Head {0}.{1}'.format(*head_index(i)), i) for i in range(len(plots))],
+        options=[('Head {0}.{1}'.format(*get_head_index(i)), i) for i in range(len(plots))],
         value=0,
         description='Select Plot:',
     )
@@ -181,7 +181,7 @@ def plot_heads(model, heads, **kwargs):
 
 def generate(cache):
     return torch.stack([
-        calculate_attns(cache, *head_index(i))
+        calculate_attns(cache, *get_head_index(i))
         for i in range(cache.model.cfg.n_layers * cache.model.cfg.n_heads)
     ])
 
@@ -401,8 +401,14 @@ def plot_attn(model, attn_data, feature=4, feature_index=None, title=None, hide_
     return fig
 
 def plot_attns(model, heads, **kwargs):
-    plots = [plot_attn(model, *head_index(h), **kwargs) for h in heads]
+    plots = [plot_attn(model, *get_head_index(h), **kwargs) for h in heads]
     return plots
+
+def plot_attn_scores(model, attn_data, feature=4, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None, **kwargs):
+    pass
+
+def plot_grid(figs):
+    display(figs)
 
 def gallery(figs):
     def on_dropdown_change(change):
