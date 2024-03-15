@@ -93,7 +93,7 @@ def unembed_resid(model, l, h, c):
     logits = torch.stack([model.unembed(r) for r in rs])
     return torch.argmax(logits, dim=-1)
 
-def calculate_attns(cache, l, h, features = ['attn', 'hp', 'q', 'k', 'v']):
+def calculate_attns(cache, l, h):
     prompts = cache.prompts
     model = cache.model
     input_tokens = model.to_tokens(prompts)
