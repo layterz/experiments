@@ -1,46 +1,23 @@
 import random
 import numpy as np
 import torch
-import math
-from itertools import permutations, product
 import einops
 import pandas as pd
 from fancy_einsum import einsum
 from rich import print
-from transformer_lens.utils import Slice
 from transformer_lens import HookedTransformer
 from plotly import express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import plotly.io as pio
-from ipywidgets import Dropdown, Output, VBox, HBox, Layout, Label, HTML
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.patches as patches
-import matplotlib.colors as mcolors
-from mpl_toolkits.mplot3d import Axes3D
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import umap
-from IPython.display import display, clear_output
 
 pio.renderers.default = "png"
 plt.ioff()
-
-
-def parse_tokens(tokens):
-    for i in range(len(tokens)):
-        t = tokens[i]
-        if t == '\n':
-            tokens[i] = '<nl>'
-        if t == ' ':
-            tokens[i] = '<sp>'
-        if t == '\t':
-            tokens[i] = '<tab>'
-        if t == '<|endoftext|>':
-            tokens[i] = 'EOS'
-    return tokens
 
 def get_device():
     device = torch.device("cpu")
@@ -49,6 +26,13 @@ def get_device():
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     return device
+    
+def get_head_index(i):
+    return (i // 12, i % 12)
+
+def get_subgroup_label(layer_index, head_index):
+    single_value = (layer_index * 12) + head_index
+    return chr(single_value + ord('A'))
 
 def run_prompts(model: HookedTransformer, *prompts, **kwargs):
     device = get_device()
@@ -57,23 +41,6 @@ def run_prompts(model: HookedTransformer, *prompts, **kwargs):
     cache.device = device
     return cache
 
-def hadamard_product_upto_position(q, k):
-    # Create a mask to select elements up to and including the position
-    mask = torch.tril(torch.ones(q.size(1), k.size(1))).to(q.device).unsqueeze(-1).unsqueeze(0)
-    
-    # Expand q and k to match the shape of the mask
-    q_expanded = q.unsqueeze(2)
-    k_expanded = k.unsqueeze(1)
-    
-    # Apply the mask to q_expanded and k_expanded
-    q_masked = q_expanded * mask
-    k_masked = k_expanded * mask
-    
-    # Take the Hadamard product of q_masked and k_masked along the last dimension
-    result = q_masked * k_masked
-    
-    return result
-
 def decompose_head(cache, l, h, pos=None):
     start, end = 0, len(cache['q', l][0])
     if pos is not None:
@@ -81,7 +48,7 @@ def decompose_head(cache, l, h, pos=None):
     q = cache['q', l][:, start:end, h, :]
     k = cache['k', l][:, start:end, h, :]
     v = cache['v', l][:, start:end, h, :]
-    return torch.stack([q, k, v])
+    return q, k, v
 
 def project_attn(model, l, h, c):
     OV = model.OV[l, h]
@@ -106,11 +73,13 @@ def calculate_attns(cache, l, h):
     ks = unembed_resid(cache.model, l, h, k.unsqueeze(2).expand(-1, -1, seq_len, -1))
     vs = unembed_resid(cache.model, l, h, v.unsqueeze(2).expand(-1, -1, seq_len, -1))
     qk = unembed_resid(cache.model, l, h, q.unsqueeze(2) * k.unsqueeze(1))
+
     q_reshaped = q.unsqueeze(2).transpose(1, 2)
     k_reshaped = k.unsqueeze(1).transpose(1, 2)
-    qk = torch.einsum('bhse,bhte->bhst', q_reshaped, k_reshaped)
-    qk = qk.transpose(1, 2).contiguous()
-    qk = unembed_resid(cache.model, l, h, qk)
+    qkp = torch.einsum('bhse,bhte->bhst', q_reshaped, k_reshaped)
+    qkp = qkp.transpose(1, 2).contiguous()
+    qkp = unembed_resid(cache.model, l, h, qkp)
+
     layers = torch.full((batch, seq_len, seq_len), l).to(cache.device)
     heads = torch.full((batch, seq_len, seq_len), h).to(cache.device)
 
@@ -118,7 +87,7 @@ def calculate_attns(cache, l, h):
         layers, heads,
         input_tokens.unsqueeze(2).expand(-1, seq_len, seq_len),
         attn,
-        qk, qs, ks, vs,
+        qk, qkp, qs, ks, vs,
     ], dim=-1)
 
     mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(cache.device)
@@ -127,59 +96,6 @@ def calculate_attns(cache, l, h):
 
     return data
 
-def unique_index_pattern(feature):
-    unique_tokens = {}
-    for x in feature:
-        for y in x:
-            value = y.int().item()
-            if value == -1:
-                unique_tokens[-1] = -len(unique_tokens)
-            if value not in unique_tokens:
-                unique_tokens[value] = len(unique_tokens)
-
-    return [
-        [unique_tokens[y.int().item()] for y in x] for x in feature
-    ]
-    
-def get_head_index(i):
-    return (i // 12, i % 12)
-
-def plot_layout(n):
-    if n == 1:
-        return {'width': 1000, 'height': 1000}
-    if n == 2:
-        return {'width': 600, 'height': 600}
-    if n == 3:
-        return {'width': 400, 'height': 400}
-    if n == 4:
-        return {'width': 350, 'height': 350}
-    if n == 5:
-        return {'width': 300, 'height': 300}
-    
-    raise Exception(f"Invalid grid shape: {n} plots.")
-
-def plot_heads(model, heads, **kwargs):
-    plots = plot_attns(model, heads, **kwargs)
-    dropdown = Dropdown(
-        options=[('Head {0}.{1}'.format(*get_head_index(i)), i) for i in range(len(plots))],
-        value=0,
-        description='Select Plot:',
-    )
-    output = Output()
-
-    def update_plot(change):
-        with output:
-            clear_output(wait=True)  # Clear the previous plot
-            # Directly display the selected plot
-            plots[change['new']].show('png')
-
-    dropdown.observe(update_plot, names='value')
-
-    # Initialize with the first plot
-    update_plot({'new': 0})
-
-    return VBox([dropdown, output])
-
 def generate(cache):
     return torch.stack([
         calculate_attns(cache, *get_head_index(i))
@@ -187,24 +103,63 @@ def generate(cache):
     ])
 
 def to_df(data):
-    n = torch.prod(torch.tensor([dim for dim in data.shape[:-1]]))
-    return pd.DataFrame(data.view(n, -1).cpu())
+    num_layers, batch_size, seq_len, _, num_features = data.shape
+    n = num_layers * batch_size * seq_len * seq_len
+    
+    df = pd.DataFrame(data.view(n, num_features).cpu())
+    
+    # Add layer, batch, and sequence position columns
+    batch_indices = torch.arange(batch_size).unsqueeze(0).unsqueeze(2).unsqueeze(3).expand(num_layers, -1, seq_len, seq_len).flatten()
+    seq_pos_indices_x = torch.arange(seq_len).unsqueeze(0).unsqueeze(1).unsqueeze(2).expand(num_layers, batch_size, seq_len, -1).flatten()
+    seq_pos_indices_y = torch.arange(seq_len).unsqueeze(0).unsqueeze(1).unsqueeze(3).expand(num_layers, batch_size, -1, seq_len).flatten()
+    
+    df.insert(0, 'batch', batch_indices.cpu())
+    df.insert(1, 'seq_pos_x', seq_pos_indices_x.cpu())
+    df.insert(2, 'seq_pos_y', seq_pos_indices_y.cpu())
+    df.columns = ['batch', 'pos_x', 'pos_y', 'layer', 'head', 'input', 'attn', 'qk', 'dp', 'q', 'k', 'v']
+    return df
+
+def df_to_tensor(df, layer, head):
+    # Filter the DataFrame based on the given layer and head
+    filtered_df = df[(df['layer'] == layer) & (df['head'] == head)]
+    
+    # Get the unique batch values
+    batches = filtered_df['batch'].unique()
+    
+    # Get the maximum pos_x and pos_y values
+    max_pos_x = filtered_df['pos_x'].max()
+    max_pos_y = filtered_df['pos_y'].max()
+    
+    # Create an empty tensor with the desired shape
+    tensor_shape = (len(batches), max_pos_x + 1, max_pos_y + 1, 9)
+    tensor = torch.full(tensor_shape, -1)
+    
+    # Fill the tensor with the values from the DataFrame
+    for _, row in filtered_df.iterrows():
+        batch = int(row['batch'])
+        pos_x = int(row['pos_x'])
+        pos_y = int(row['pos_y'])
+        features = torch.tensor(row[['batch', 'pos_x', 'input', 'attn', 'qk', 'dp', 'q', 'k', 'v']].values)
+        tensor[batch, pos_y, pos_x] = features
+    
+    return tensor
 
 def load(filepath):
     df = pd.read_csv(filepath)
-    df.columns = ['layer', 'head', 'Input token', 'attn', 'hp', 'q', 'k', 'v']
     return df
 
-def token_freq_data(model, df, feature):
-    data = df.values
-    feature_data = data[:, feature]
-    tf = pd.DataFrame({'token': feature_data})
-    tf = tf[tf['token'] != -1]
-    tf['token'] = tf['token'].astype(int)
-    tf = tf.groupby(['head', 'token']).size().reset_index(name='frequency')
-    tf['token str'] = tf['token'].apply(model.to_single_str_token)
-    tf['rank'] = tf.groupby('head')['frequency'].rank(method='dense', ascending=False)
-    return tf
+def load_or_create_data(filename, model, *prompts):
+    try:
+        df = load(filename)
+    except FileNotFoundError as e:
+        cache = run_prompts(model, *prompts)
+        print(f'Creating new file {filename}')
+        data = generate(cache)
+        df = to_df(data)
+        df.to_csv(filename, index=False)
+    return df
+
+# PLOTTING FUNCTIONS
 
 def plot_scatter(x, y, c, ax=None, cmap=cm.viridis, jitter_scale=0, s=5, alpha=0.7, third_dim=None):
     show_fig = False
@@ -266,52 +221,18 @@ def plot_token_embeddings(model, token_counts, embedding_method, colorbar_label=
     third_dim = None if projection == 2 else df_embeddings[f'{embedding_method}3']
     plot_scatter(df_embeddings[f'{embedding_method}1'], df_embeddings[f'{embedding_method}2'], df_embeddings[colorbar_label], third_dim=third_dim, ax=ax)
 
-def add_max_labels(df, group_col, value_col, label_col, label_func):
-    max_values = df.groupby(group_col)[value_col].max()
-    for group, max_value in max_values.items():
-        max_index = df[(df[group_col] == group) & (df[value_col] == max_value)].index[0]
-        max_label = df.loc[max_index, label_col]
-        label_text = f'({label_func(max_label)})'
-        plt.text(max_label, max_value, label_text, fontsize=10, ha='left', va='bottom')
-
-def figure(*figs, rows=None, cols=None, figsize=None, title=None, footer=None):
-    num_figs = len(figs)
-
-    if rows is None and cols is None:
-        cols = math.ceil(math.sqrt(num_figs))
-        rows = math.ceil(num_figs / cols)
-    elif rows is None:
-        rows = math.ceil(num_figs / cols)
-    elif cols is None:
-        cols = math.ceil(num_figs / rows)
-
-    if figsize is None:
-        figsize = (cols*6, rows*6)
-
-    fig, axs = plt.subplots(rows, cols, figsize=figsize)
-
-    if isinstance(axs, np.ndarray):
-        axs = axs.flatten()
-    else:
-        axs = [axs]
-
-    for i, fig_obj in enumerate(figs):
-        if i < num_figs:
-            fig_obj.canvas.draw()
-            plt.sca(axs[i])
-            plt.imshow(fig_obj.canvas.renderer._renderer, cmap='viridis')
-            plt.axis('off')
-        else:
-            axs[i].remove()
-
-    if title is not None:
-        fig.suptitle(title, fontsize=16, fontweight='bold', y=0.95)
-
-    if footer is not None:
-        fig.text(0.5, 0.05, footer, fontsize=12, ha='center', va='bottom')
-
-    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
-    return fig
+def parse_tokens(tokens):
+    for i in range(len(tokens)):
+        t = tokens[i]
+        if t == '\n':
+            tokens[i] = '<nl>'
+        if t == ' ':
+            tokens[i] = '<sp>'
+        if t == '\t':
+            tokens[i] = '<tab>'
+        if t == '<|endoftext|>':
+            tokens[i] = 'EOS'
+    return tokens
 
 def add_attn_overlay(ax, pattern, threshold=0.3):
     seq_len = pattern.shape[1]
@@ -332,24 +253,23 @@ def add_attn_overlay(ax, pattern, threshold=0.3):
 
 def add_axis_labels(model, ax, data, fontsize=12, feature_index=0):
     seq_len = data.shape[1]
-    input_tokens = data[feature_index, :, :, 2].int().tolist()
     input_str_tokens = [
-        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 2]).int().tolist()
+        model.to_single_str_token(int(t)) for t in torch.diag(data[feature_index, :, :, 2]).tolist()
     ]
     input_str_tokens = parse_tokens(input_str_tokens)
 
     q_str_tokens = [
-        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 5]).int().tolist()
+        model.to_single_str_token(int(t)) for t in torch.diag(data[feature_index, :, :, 6]).tolist()
     ]
     q_str_tokens = parse_tokens(q_str_tokens)
 
     k_str_tokens = [
-        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 6]).int().tolist()
+        model.to_single_str_token(int(t)) for t in torch.diag(data[feature_index, :, :, 7]).tolist()
     ]
     k_str_tokens = parse_tokens(k_str_tokens)
 
     v_str_tokens = [
-        model.to_single_str_token(t) for t in torch.diag(data[feature_index, :, :, 7]).int().tolist()
+        model.to_single_str_token(int(t)) for t in torch.diag(data[feature_index, :, :, 8]).tolist()
     ]
     v_str_tokens = parse_tokens(v_str_tokens)
 
@@ -373,9 +293,9 @@ def add_axis_labels(model, ax, data, fontsize=12, feature_index=0):
 
 def add_token_labels(model, ax, data, feature=4, feature_index=0, fontsize=10):
     seq_len = data.shape[1]
-    tokens = data[feature_index, :, :, feature].int().tolist()
+    tokens = data[feature_index, :, :, feature].tolist()
     str_tokens = [
-        [model.to_single_str_token(t) for t in row if t > -1] for row in tokens
+        [model.to_single_str_token(int(t)) for t in row if t > -1] for row in tokens
     ]
     for i in range(seq_len):
         for j in range(i + 1):
@@ -383,7 +303,21 @@ def add_token_labels(model, ax, data, feature=4, feature_index=0, fontsize=10):
             ax.text(j, i, text, ha='center', va='center', fontsize=fontsize, color='white', rotation=45)
     return ax
 
-def plot_attn(model, attn_data, feature=4, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None, **kwargs):
+def unique_index_pattern(feature):
+    unique_tokens = {}
+    for x in feature:
+        for y in x:
+            value = y.item()
+            if value == -1:
+                unique_tokens[-1] = -len(unique_tokens)
+            if value not in unique_tokens:
+                unique_tokens[value] = len(unique_tokens)
+
+    return [
+        [unique_tokens[y.item()] for y in x] for x in feature
+    ]
+
+def plot_attn(model, attn_data, feature=4, feature_index=None, title=None, hide_labels=False, show_attn_overlay=True, show_axis=True, show_grid_labels=True, ax=None):
     attention = attn_data[:, :, :, 3]
     feature_data = attn_data[:, :, :, feature]
     if feature_index is None:
@@ -406,120 +340,6 @@ def plot_attn(model, attn_data, feature=4, feature_index=None, title=None, hide_
     if hide_labels:
         ax.axis('off')
     
-    return fig
-
-def plot_attns(model, heads, **kwargs):
-    plots = [plot_attn(model, *get_head_index(h), **kwargs) for h in heads]
-    return plots
-
-def plot_grid(figs):
-    display(figs)
-
-def gallery(figs):
-    def on_dropdown_change(change):
-        layer, head = change['new'].split(',')
-        layer = int(layer)
-        head = int(head)
-        fig = plot_attn(layer, head)
-        output.clear_output(wait=True)
-        with output:
-            display(fig)
-
-    # Create a dropdown widget
-    options = [(f"Layer {layer}, Head {head}", f"{layer},{head}") for layer in range(12) for head in range(12)]
-    dropdown = Dropdown(options=options, description="Select Layer and Head:")
-
-    # Create an output widget to display the plot
-    output = Output()
-
-    # Observe changes in the dropdown value
-    dropdown.observe(on_dropdown_change, names='value')
-
-    # Display the dropdown and output widgets
-    display(dropdown)
-    display(output)
-
-def shared_tokens(df, component='hp'):
-    at = df[['layer', 'head', 'Input token', component, 'attn']]
-    at.columns = ['layer', 'head', 'input_token', 'attention_token', 'attention_score']
-
-    # Analyze subgroups for each attention head
-    subgroup_data = []
-    for layer, head in at[['layer', 'head']].drop_duplicates().itertuples(index=False):
-        subgroup_mask = (at['layer'] == layer) & (at['head'] == head)
-        unique_tokens = at.loc[subgroup_mask, 'attention_token'].unique()
-        subgroup_data.append({
-            'Layer': layer,
-            'Head': head,
-            'Unique Tokens': len(unique_tokens),
-            'Tokens': ','.join(map(str, unique_tokens))
-        })
-
-    subgroups_df = pd.DataFrame(subgroup_data)
-
-    # Analyze shared tokens between subgroups
-    shared_token_data = []
-    for i, (layer1, head1) in enumerate(subgroups_df[['Layer', 'Head']].itertuples(index=False)):
-        for layer2, head2 in subgroups_df[['Layer', 'Head']].iloc[i+1:].itertuples(index=False):
-            tokens1 = set(map(float, subgroups_df[(subgroups_df['Layer'] == layer1) & (subgroups_df['Head'] == head1)]['Tokens'].iloc[0].split(',')))
-            tokens2 = set(map(float, subgroups_df[(subgroups_df['Layer'] == layer2) & (subgroups_df['Head'] == head2)]['Tokens'].iloc[0].split(',')))
-            shared_tokens = tokens1.intersection(tokens2)
-            if len(shared_tokens) > 0:
-                shared_token_data.append({
-                    'Subgroup 1': chr((int(layer1) * 12) + int(head1) + 65),
-                    'Subgroup 2': chr((int(layer2) * 12) + int(head2) + 65),
-                    'Shared Tokens': len(shared_tokens),
-                    'Tokens': ','.join(map(str, shared_tokens))
-                })
-
-    return pd.DataFrame(shared_token_data)
-
-def get_subgroup_label(layer_index, head_index):
-    single_value = (layer_index * 12) + head_index
-    return chr(single_value + ord('A'))
-
-def visualize_shared_tokens(df, ax=None):
-    # Assuming your data is stored in a DataFrame called 'df'
-    # Extract the subgroup information and shared token counts from the DataFrame
-    subgroup1 = df['Subgroup 1'].astype(str)
-    subgroup2 = df['Subgroup 2'].sort_values(ascending=True).astype(str)
-    shared_tokens = df['Shared Tokens'].astype(int)
-
-    # Create a new DataFrame with subgroups as columns and shared token counts
-    heatmap_data = pd.DataFrame({'Subgroup 1': subgroup1, 'Subgroup 2': subgroup2, 'Shared Tokens': shared_tokens})
-
-    # Pivot the data to create a matrix
-    shared_matrix = heatmap_data.pivot_table(index='Subgroup 2', columns='Subgroup 1', values='Shared Tokens', fill_value=0)
-
-    # Create a figure and axes
-    fig = None
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 6))
-
-    # Create the heatmap using Seaborn
-    sns.heatmap(shared_matrix, annot=False, cmap='viridis', cbar_kws={'label': 'Shared Tokens'}, ax=ax)
-
-    # Set the plot title and labels
-    ax.set_title('Heatmap of Shared Tokens between Subgroups')
-    ax.set_xlabel('Subgroup')
-    ax.set_ylabel('Subgroup')
-    ax.grid(which='major', linestyle='-', linewidth=0.5, color='white')
-
-    num_ticks = 12  # Number of ticks to display
-    step = len(shared_matrix) // num_ticks
-    xtick_labels = [(i // 12, i % 12) for i in range(0, len(shared_matrix.columns), step)]
-    ytick_labels = [(i // 12, i % 12) for i in range(0, len(shared_matrix.index), step)]
-
-    ax.set_xticks(range(0, len(shared_matrix.columns), step))
-    ax.set_xticklabels(xtick_labels)
-    ax.set_yticks(range(0, len(shared_matrix.index), step))
-    ax.set_yticklabels(ytick_labels)
-
-    plt.xticks(rotation=-45, ha='left')
-    plt.yticks(rotation=45, ha='right')
-
-    # Display the plot
-    plt.tight_layout()
     return fig
 
 def print_max_logits(cache, component='resid_post', layer=-1, k=5):
@@ -589,3 +409,115 @@ def calculate_head_contribution(cache, towards, layer=-1, pos_slice=-1):
         layer=cache.model.cfg.n_layers,
         head_index=cache.model.cfg.n_heads,
     )
+
+def plot_shared_token_heatmap(shared_token_df, token_type, ax=None, fig_size=(8, 6)):
+    # Filter the DataFrame based on the specified token type
+    token_type_col = f'{token_type}_count'
+    filtered_df = shared_token_df[['head_index_2', 'head_index_1', token_type_col]]
+    
+    # Pivot the DataFrame to create a matrix of shared token counts
+    pivot_df = filtered_df.pivot(index='head_index_2', columns='head_index_1', values=token_type_col)
+    
+    # Create a new figure and axis if not provided
+    if ax is None:
+        fig, ax = plt.subplots(figsize=fig_size)
+    
+    # Create a heatmap using seaborn
+    sns.heatmap(pivot_df, annot=False, cmap='viridis', fmt='f', ax=ax)
+    ax.set_title(token_type)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel('')
+    ax.set_ylabel('')
+    
+    return ax
+
+# SPECIFIC DATA ANALYSIS FUNCTIONS
+
+def token_freq_data(model, df, feature):
+    data = df.values
+    feature_data = data[:, feature]
+    tf = pd.DataFrame({'token': feature_data})
+    tf = tf[tf['token'] != -1]
+    tf['token'] = tf['token'].astype(int)
+    tf = tf.groupby(['head', 'token']).size().reset_index(name='frequency')
+    tf['token str'] = tf['token'].apply(model.to_single_str_token)
+    tf['rank'] = tf.groupby('head')['frequency'].rank(method='dense', ascending=False)
+    return tf
+
+def calculate_token_frequencies(model, df, token_cols=['qk', 'dp', 'q', 'k', 'v']):
+    # Melt the DataFrame to convert columns to rows
+    melted_df = pd.melt(df, id_vars=['layer', 'head'], value_vars=token_cols, var_name='token_type', value_name='token')
+    
+    # Convert token column to integer and remove rows with -1 token values
+    melted_df['token'] = melted_df['token'].astype(int)
+    melted_df = melted_df[melted_df['token'] != -1]
+    melted_df['head_index'] = ((melted_df['layer']) * 12) + (melted_df['head'])
+    
+    # Group by layer, head, token type, and token, and count the occurrences
+    frequency_counts = melted_df.groupby(['head_index', 'token_type', 'token']).size().reset_index(name='count')
+    
+    # Pivot the DataFrame to have token types as columns and fill missing values with 0
+    result = frequency_counts.pivot_table(index=['head_index', 'token'], columns='token_type', values='count', fill_value=0)
+    result.columns = token_cols
+    
+    # Calculate the rank for each token type
+    for col in token_cols:
+        result[f'{col}_rank'] = result.groupby('head_index')[col].rank(method='dense', ascending=False)
+    
+    # Reset the index to convert layer, head, and token to regular columns
+    result = result.reset_index()
+    result['token str'] = result['token'].apply(model.to_single_str_token)
+    
+    return result
+
+def calculate_shared_tokens(df, token_types=['qk', 'dp', 'q', 'k', 'v']):
+    # Create an empty dictionary to store the shared tokens for each pair of heads and token type
+    shared_tokens = {}
+
+    # Get the unique head indices
+    head_indices = df['head_index'].unique()
+
+    # Iterate over each pair of head indices
+    for i in range(len(head_indices)):
+        for j in range(i + 1, len(head_indices)):
+            head_index_1 = head_indices[i]
+            head_index_2 = head_indices[j]
+
+            # Initialize the shared token dictionary for the current pair of heads
+            shared_tokens[(head_index_1, head_index_2)] = {}
+
+            # Iterate over each token type
+            for token_type in token_types:
+                # Get the tokens for each head index and token type
+                tokens_1 = df[(df['head_index'] == head_index_1) & (df[token_type] != 0)]['token'].values
+                tokens_2 = df[(df['head_index'] == head_index_2) & (df[token_type] != 0)]['token'].values
+
+                # Find the shared tokens between the two heads for the current token type
+                shared = set(tokens_1) & set(tokens_2)
+
+                # Store the shared tokens in the dictionary
+                shared_tokens[(head_index_1, head_index_2)][token_type] = shared
+
+    # Create a list to store the shared token counts and tokens
+    shared_token_data = []
+
+    # Iterate over the shared token dictionary and populate the list
+    for (head_index_1, head_index_2), token_data in shared_tokens.items():
+        row_data = {
+            'head_index_1': head_index_1,
+            'head_index_2': head_index_2
+        }
+
+        # Iterate over each token type and add the count and shared tokens to the row data
+        for token_type in token_types:
+            shared_tokens_type = token_data.get(token_type, set())
+            row_data[f'{token_type}_count'] = len(shared_tokens_type)
+            row_data[f'{token_type}_shared_tokens'] = ', '.join(map(str, shared_tokens_type))
+
+        shared_token_data.append(row_data)
+
+    # Create a DataFrame from the list of shared token data
+    shared_token_df = pd.DataFrame(shared_token_data)
+
+    return shared_token_df
