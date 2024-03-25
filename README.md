@@ -6,6 +6,6 @@ I'm currently focused on exploring what I've dubbed attention tokens, which are 
 The plot on the left shows the t-SNE of the embeddings of the element-wise Q*K attention tokens. The plot on the right shows how heads are connected by number of shared QK attention tokens.
 
 <div style="display: flex; justify-content: center;">
-    <img src="./notebooks/imdb-tsne.png" alt="Image 1" style="width: 45%; margin-right: 10px;">
-    <img src="./notebooks/shared-token_imdb.png" alt="Image 2" style="width: 45%;">
+    <img src="./notebooks/images/imdb-tsne.png" alt="Image 1" style="width: 45%; margin-right: 10px;">
+    <img src="./notebooks/images/shared-token_imdb.png" alt="Image 2" style="width: 45%;">
 </div>
