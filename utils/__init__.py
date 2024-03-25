@@ -148,8 +148,10 @@ def load(filepath):
     df = pd.read_csv(filepath)
     return df
 
-def load_or_create_data(filename, model, *prompts):
+def load_or_create_data(filename, model, *prompts, force_create=False):
     try:
+        if force_create:
+            raise FileNotFoundError
         df = load(filename)
     except FileNotFoundError as e:
         cache = run_prompts(model, *prompts)
